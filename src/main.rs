@@ -40,12 +40,6 @@ struct Node {
     value: u8,
 }
 
-enum _UserInput {
-    AddNode(Ipv4Addr, Port),
-    ChangeValue(u8),
-    GetNodeList,
-}
-
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -92,14 +86,16 @@ async fn main() {
                 let mut maybe_socket: Option<SocketAddrV4> = None;
                 {
                     let db = db.lock();
-                    for _ in 0..5 {
-                        let random_index = rand::random::<usize>() % db.len();
-                        let (ip, nodes) = db.iter().nth(random_index).unwrap();
-                        let random_index = rand::random::<usize>() % nodes.len();
-                        let node = nodes.get(random_index).unwrap();
-                        if *ip != *self_addr.ip() || node.port != self_addr.port() {
-                            maybe_socket = Some(SocketAddrV4::new(node.ip, node.port));
-                            break;
+                    if !db.is_empty() {
+                        for _ in 0..5 {
+                            let random_index = rand::random::<usize>() % db.len();
+                            let (ip, nodes) = db.iter().nth(random_index).unwrap();
+                            let random_index = rand::random::<usize>() % nodes.len();
+                            let node = nodes.get(random_index).unwrap();
+                            if *ip != *self_addr.ip() || node.port != self_addr.port() {
+                                maybe_socket = Some(SocketAddrV4::new(node.ip, node.port));
+                                break;
+                            }
                         }
                     }
                 }
@@ -284,7 +280,7 @@ async fn poll_node(
         .filter(|line| !line.is_empty())
         .map(|line| *line)
         .collect();
-    println!();
+    let mut change_made = false;
     for line in lines {
         let split_line: Vec<&str> = line.split(',').collect();
         let peer_socket = match SocketAddrV4::from_str(split_line[0]) {
@@ -332,9 +328,13 @@ async fn poll_node(
 
                 for mut n in nodes.iter_mut() {
                     if n.port == peer_socket.port() {
-                        if time.duration_since(n.time).is_ok() {
+                        if time.duration_since(n.time).is_ok() && value != n.value {
                             n.time = time;
                             n.value = value;
+                            if !change_made {
+                                println!();
+                                change_made = true;
+                            }
                             print_node_value(peer_socket.to_string(), value);
                         }
                         found_node = true;
@@ -356,16 +356,26 @@ async fn poll_node(
                         nodes.reverse();
                         nodes.truncate(3);
                     }
+                    if !change_made {
+                        println!();
+                        change_made = true;
+                    }
                     print_node_value(peer_socket.to_string(), value);
                 }
             } else {
                 db.insert(ip, vec![node]);
+                if !change_made {
+                    println!();
+                    change_made = true;
+                }
                 print_node_value(peer_socket.to_string(), value);
             }
         }
     }
-    print!(">> ");
-    std::io::stdout().flush().expect("Failed to flush stdout");
+    if change_made {
+        print!(">> ");
+        std::io::stdout().flush().expect("Failed to flush stdout");
+    }
 }
 
 fn print_node_value(node: String, value: u8) {
