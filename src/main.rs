@@ -1,5 +1,9 @@
+#![feature(slice_as_chunks)]
+#![feature(is_some_with)]
+
 use clap::Parser;
 use parking_lot::Mutex;
+use rand::{self, RngCore};
 use std::{
     cmp::Ordering,
     collections::HashMap,
@@ -44,6 +48,9 @@ struct Node {
 
 #[tokio::main]
 async fn main() {
+    // Set adversarial mode to false
+    let adversarial_mode = Arc::new(Mutex::new(false));
+
     // Parse IP and port from command line arguments
     let args = Args::parse();
     let self_addr = SocketAddrV4::new(args.ip, args.port);
@@ -64,8 +71,10 @@ async fn main() {
         // it sends the IP and port to the node polling thread via the channel sender (tx)
         let db = db.clone();
         let self_addr = self_addr.clone();
+        let adversarial_mode = adversarial_mode.clone();
+        let black_list = black_list.clone();
         thread::spawn(move || {
-            process_input(db, self_addr, tx);
+            process_input(db, self_addr, tx, adversarial_mode, black_list);
         });
     }
 
@@ -98,50 +107,103 @@ async fn main() {
         // Clone the handle to the database
         let db = db.clone();
 
+        let adversarial_mode = adversarial_mode.clone();
+
         // A new task is spawned for each inbound socket. The socket is
         // moved to the new task and processed there.
         tokio::spawn(async move {
-            process(socket, db).await;
+            process(socket, db, adversarial_mode).await;
         });
     }
 }
 
-async fn process(mut socket: TcpStream, db: Db) {
+async fn process(mut socket: TcpStream, db: Db, adversarial_mode: Arc<Mutex<bool>>) {
+    // Check if adversarial mode is enabled
+    let adv_mode;
+    {
+        let adversarial_mode = adversarial_mode.lock();
+        adv_mode = *adversarial_mode;
+    }
+
     let mut buf: Vec<u8> = vec![];
+    let node_vec: Vec<(Ipv4Addr, Vec<Node>)>;
     {
         let db = db.lock();
-        // For each node in the DB, serialize the node info and write it to the buffer
-        for (key, value) in db.iter() {
-            for node in value.iter() {
-                let Node { port, time, value } = node;
-                buf.extend_from_slice(key.to_string().as_bytes());
-                buf.push(b':');
-                buf.extend_from_slice(port.to_string().as_bytes());
-                buf.push(b',');
-                let time_since_unix_epoch = time
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                buf.extend(time_since_unix_epoch.to_string().as_bytes());
-                buf.push(b',');
-                buf.extend_from_slice(value.to_string().as_bytes());
-                buf.push(0xA);
+        let db_vec: Vec<(&Ipv4Addr, &Vec<Node>)> = db.iter().collect();
+        node_vec = db_vec
+            .iter()
+            .map(|(ip, nodes)| (*ip.clone(), nodes.clone().to_owned()))
+            .collect();
+    }
+
+    // Generate random number to determine adversarial behavior
+    let rand = rand::random::<u8>() % 4;
+
+    // For each node in the DB, serialize the node info and write it to the buffer
+    for (key, value) in node_vec {
+        for node in value.iter() {
+            let Node { port, time, value } = node;
+            buf.extend_from_slice(key.to_string().as_bytes());
+            buf.push(b':');
+            buf.extend_from_slice(port.to_string().as_bytes());
+            buf.push(b',');
+            let mut time_since_unix_epoch = time
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            // If adversarial mode is enabled, pick attack based on random number
+            if adv_mode {
+                if rand == 0 {
+                    // Attack 1: Send future timestamps
+                    time_since_unix_epoch += 1000000;
+                } else if rand == 1 {
+                    // Attack 2: Send random bytes
+                    let mut rand_array = [0u8; 100];
+                    rand::thread_rng().fill_bytes(rand_array.as_mut_slice());
+                    buf.extend(rand_array.iter());
+                } else if rand == 2 {
+                    // Attack 3: Try to get peer to hang by sending partial response and then sleeping for 30 seconds
+                    let _ = socket.write_all(&buf).await;
+                    sleep(TokioDuration::from_secs(30)).await;
+                }
             }
+
+            buf.extend(time_since_unix_epoch.to_string().as_bytes());
+            buf.push(b',');
+            buf.extend_from_slice(value.to_string().as_bytes());
+            buf.push(0xA);
         }
     }
 
-    // Write the buffer to the socket and close the connection
-    socket
-        .write_all(&buf)
-        .await
-        .unwrap_or_else(|err| println!("Error writing to socket: {}", err));
-    socket
-        .shutdown()
-        .await
-        .unwrap_or_else(|err| println!("Error shutting down socket: {}", err));
+    if adv_mode && rand == 3 {
+        // Attack 4: break up response into chunks of 3 bytes
+        let (chunks, remainder) = buf.as_chunks::<3>();
+        for chunk in chunks {
+            socket.write_all(chunk).await.unwrap();
+            sleep(TokioDuration::from_millis(100)).await;
+        }
+        socket.write_all(remainder).await.unwrap();
+    } else {
+        // Write the buffer to the socket and close the connection
+        socket
+            .write_all(&buf)
+            .await
+            .unwrap_or_else(|err| println!("Error writing to socket: {}", err));
+        socket
+            .shutdown()
+            .await
+            .unwrap_or_else(|err| println!("Error shutting down socket: {}", err));
+    }
 }
 
-fn process_input(db: Db, self_addr: SocketAddrV4, tx: mpsc::Sender<(Ipv4Addr, Port)>) {
+fn process_input(
+    db: Db,
+    self_addr: SocketAddrV4,
+    tx: mpsc::Sender<(Ipv4Addr, Port)>,
+    adversarial_mode: Arc<Mutex<bool>>,
+    black_list: BlackList,
+) {
     let mut buf = String::new();
     loop {
         print!(">> ");
@@ -200,8 +262,19 @@ fn process_input(db: Db, self_addr: SocketAddrV4, tx: mpsc::Sender<(Ipv4Addr, Po
                     }
                 }
             }
+            Some('a') => {
+                // Toggle adversarial mode
+                let mut adversarial_mode = adversarial_mode.lock();
+                *adversarial_mode = !*adversarial_mode;
+                println!("Adversarial mode: {}", *adversarial_mode);
+            }
+            Some('b') => {
+                // Print the blacklist
+                let black_list = black_list.lock();
+                println!("Blacklist: {:?}", *black_list);
+            }
             Some(_) => {
-                println!("Invalid input, please input +<ip>:<port>, ?, !, or a digit");
+                println!("Invalid input, please input +<ip>:<port>, ?, !, a, b, or a digit");
             }
             None => {
                 println!("No input read, please try again");
@@ -240,7 +313,9 @@ async fn poll_node(
 
     // Read data from the socket into the buffer
     let mut buf: String = String::new();
-    socket.read_to_string(&mut buf).await.unwrap();
+    if socket.read_to_string(&mut buf).await.is_err() {
+        return;
+    }
 
     // Get rid of all whitespace except for newlines
     buf.retain(|c| !c.is_whitespace() || c == '\n');
@@ -338,9 +413,14 @@ async fn handle_first_time_node_connection_req(
 ) {
     loop {
         while let Some(message) = rx.recv().await {
+            // Spawn a tokio task to handle first time node connection requests from user input
+            // Listens for IP and port from the channel receiver (rx), and attempts to connect to the node
             let db = db.clone();
             let black_list = black_list.clone();
-            poll_node(db, message.0, message.1, self_addr, black_list).await;
+            let self_addr = self_addr.clone();
+            tokio::spawn(async move {
+                poll_node(db, message.0, message.1, self_addr, black_list).await;
+            });
         }
     }
 }
@@ -383,9 +463,14 @@ async fn background_node_polling(db: Db, black_list: BlackList, self_addr: Socke
         }
         // If we successfully selected a socket, poll it
         if let Some(socket) = maybe_socket {
+            // Spawn a tokio task to handle first time node connection requests from user input
+            // Listens for IP and port from the channel receiver (rx), and attempts to connect to the node
             let db = db.clone();
             let black_list = black_list.clone();
-            poll_node(db, *socket.ip(), socket.port(), self_addr, black_list).await;
+            let self_addr = self_addr.clone();
+            tokio::spawn(async move {
+                poll_node(db, *socket.ip(), socket.port(), self_addr, black_list).await;
+            });
         }
 
         sleep(BACKGROUND_POLLING_INTERVAL).await;
@@ -422,7 +507,7 @@ fn add_node_to_db(db: Db, ip: &Ipv4Addr, node: Node, self_addr: SocketAddrV4) ->
         for mut n in nodes.iter_mut() {
             // If we find the node and the timestamp is newer, update the node
             if n.port == node.port {
-                if node.time.duration_since(n.time).is_ok() && node.value != n.value {
+                if node.time.duration_since(n.time).is_ok_and(|x| !x.is_zero()) {
                     n.time = node.time;
                     n.value = node.value;
 
